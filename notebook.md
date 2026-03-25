@@ -836,12 +836,345 @@ if(需要上报) send()
 
 ---
 
-### 总结 - 创建 SummarizeFn（用于 compaction 内容压缩）
+### 创建 SummarizeFn（用于 compaction 内容压缩）
 把已经生成的 AI 内容 / 长对话，再丢给 AI 重新总结 → 压缩文字数量 → 确保不超过 params.maxTokens 长度限制。
 通过 pi-ai 的 completeSimple 实现，与 Agent 当前的 model/apiKey 绑定
 - pi-ai：你们内部封装的 AI 调用工具库
 - completeSimple：库里最简单、直接调用 AI 生成文本的方法
 - 在你代码里：用来调用 AI 做内容总结、压缩长度
+
+
+### 上下文压缩：裁剪 + 可选摘要
+利用SummarizeFn方法进行上下文裁剪
+
+### 根据策略/沙箱生成最终可用工具集
+根据全局业务策略（整个系统允许哪些工具，禁止记忆查询、获取、保存）和安全沙箱策略（运行环境禁止高危操作，黑名单模式，禁止执行系统命令，写和修改）
+
+### AI 主代理创建 / 管理子代理
+
+「主代理 → 启动子代理」 的完整流程：
+1. 生成子代理唯一 ID
+2. 禁止子代理再生子代理（防止套娃）
+3. 异步启动子代理去执行任务
+4. 子代理完成后把摘要发给主代理
+5. 失败了就发错误事件
+6. 可选择是否清理子会话
+
+最关键的 3 个特点（必须记住）
+1. 异步非阻塞
+主代理不用等子代理跑完
+2. 禁止套娃
+子代理不能再生子代理
+3. 结果自动回流
+子代理结果自动追加到父对话历史
+
+
+
+## 运行Agent，AI Agent 运行主流程深度解析
+
+我直接用最通俗、最清晰、不绕弯、新手能完全看懂的方式，把这段超级核心的 Agent 运行主流程给你讲透。
+
+一句话总结
+
+这段代码就是 AI Agent 的主引擎 run() 方法
+
+作用：接收用户消息 → 跑一轮完整的 AI 思考 + 工具调用 + 对话流程 → 返回最终结果
+
+你可以把它理解成：
+
+AI 的大脑启动入口
+
+用户一发消息，就从这里开始跑完全部逻辑。
+
+
+---
+整体流程（超级简单版）
+
+1. 解析会话 ID
+
+2. 排队执行（防止并发乱掉）
+
+3. 创建本次运行的唯一 ID + 中断控制器
+
+4. 检查上下文窗口大小（防止爆 token）
+
+5. 加载历史对话
+
+6. 处理技能触发（/skill 命令）
+
+7. 把用户消息存进会话
+
+8. 压缩过长的历史（compaction）
+
+9. 构建最终系统提示词（你上一段看的那个）
+
+10. 获取最终可用工具（你最早看的那个）
+
+11. 进入 AI 主循环（思考→调用工具→思考→结束）
+
+12. 处理工具审批（是否需要人工同意）
+
+13. 实时抛出事件（开始、思考、工具调用、结束、错误）
+
+14. 清理资源，返回结果
+
+
+---
+逐段逐行通俗解释
+
+1. 方法入口：接收用户消息
+```ts
+async run(sessionIdOrKey: string, userMessage: string): Promise<RunResult> {
+```
+- 输入：会话ID、用户说的话
+
+- 输出：AI 运行完的最终结果
+
+
+---
+2. 解析会话 + 排队执行
+```ts
+const sessionKey = resolveSessionKey(...)
+const sessionLane = resolveSessionLane(sessionKey)
+const globalLane = resolveGlobalLane()
+
+return enqueueInLane(sessionLane, () =>
+  enqueueInLane(globalLane, async () => { ... })
+)
+```
+作用：排队！
+
+- 同一个会话，同一时间只能跑一个任务
+
+- 防止并发混乱、消息错乱
+
+
+---
+3. 创建本次运行的唯一标识 & 中断器
+```ts
+const runId = crypto.randomUUID()
+const runAbortController = new AbortController()
+this.runAbortControllers.set(runId, runAbortController)
+```
+- runId：本次运行的唯一ID
+
+- AbortController：用来中途停止 AI
+
+
+---
+4. 发出事件：Agent 开始运行
+```ts
+this.emit({ type: "agent_start", ... })
+```
+外部（前端/日志）能收到：AI 开始跑了
+
+
+---
+5. 检查上下文窗口（token 够不够）
+```ts
+const ctxGuard = evaluateContextWindowGuard(...)
+if (ctxGuard.shouldBlock) {
+  throw new Error("上下文窗口过小")
+}
+```
+防止模型因为 token 太少跑不起来。
+
+
+---
+6. 加载历史对话
+```ts
+const history = await this.sessions.load(sessionKey)
+```
+把以前的对话加载进来，AI 才有记忆。
+
+
+---
+7. 构建工具上下文（给工具用的环境）
+```ts
+const toolCtx: ToolContext = {
+  workspaceDir, sessionKey, agentId, memory, spawnSubagent
+}
+```
+工具（文件读写、执行命令、记忆、生子代理）都靠这个。
+
+
+---
+8. 技能匹配（/命令 触发技能）
+```ts
+if (this.enableSkills) {
+  const match = await this.skills.match(userMessage)
+  if (match) {
+    把消息改成让AI使用这个技能
+  }
+}
+```
+比如用户输 /write 代码
+
+→ AI 自动触发写作技能
+
+
+---
+9. 把用户消息存入会话
+```ts
+await this.sessions.append(sessionKey, userMsg)
+```
+历史记录里加上这一句。
+
+
+---
+10. 压缩历史（Compaction）
+```ts
+const prep = await this.prepareMessagesForRun(...)
+```
+对话太长 → 自动总结前面的内容 → 节省 token
+
+
+---
+11. 构建系统提示（你之前看懂的那个方法）
+```ts
+const systemPrompt = await this.buildSystemPrompt({ sessionKey })
+```
+拼出最终完整指令给 AI。
+
+
+---
+12. 获取最终工具集（你最早看懂的方法）
+```ts
+const rawTools = this.resolveToolsForRun()
+```
+经过内存开关、沙箱、策略过滤后的真正可用工具。
+
+
+---
+13. 工具审批（关键安全机制）
+```ts
+const checkToolApproval = ...
+```
+高危工具（exec、write）可设置：
+
+- 需要用户同意才能执行
+
+- 可以永久允许（allow-always）
+
+- 可以直接拒绝（deny）
+
+
+---
+14. 运行 AI 主循环（核心中的核心）
+```ts
+const stream = runAgentLoop({ ... })
+```
+这一步就是：
+
+AI 思考 → 决定是否调用工具 → 调用工具 → 再思考 → 直到得出最终答案
+
+一边跑一边实时抛出事件：
+
+- agent_think
+
+- tool_call
+
+- tool_result
+
+- agent_complete
+
+
+---
+15. 监听事件流，往外抛
+```ts
+for await (const event of stream) {
+  this.emit(event)
+}
+```
+前端/调用方实时收到 AI 的思考过程。
+
+
+---
+16. 返回最终结果
+```ts
+return {
+  runId,
+  text: loopResult.finalText,
+  turns: 循环次数,
+  toolCalls: 调用工具次数,
+  skillTriggered: 触发的技能,
+  memoriesUsed: 使用的记忆条数
+}
+```
+
+---
+17. 异常捕获 + 最终清理
+```ts
+catch (err) {
+  发送错误事件
+}
+finally {
+  清理工具执行状态
+  删除中断器
+}
+```
+
+---
+最关键的 5 个核心点（必须记住）
+
+1. 排队执行：同会话不并发
+
+2. 会话历史管理：加载、追加、压缩
+
+3. 动态系统提示：技能、记忆、沙箱全部拼进去
+
+4. 动态工具过滤：安全策略层层过滤
+
+5. AI 主循环：思考 → 工具 → 思考 → 结束
+
+
+---
+用生活例子彻底懂
+
+你（用户）说：帮我写一个README
+
+1. run() 启动
+
+2. 排队
+
+3. 加载历史
+
+4. 匹配技能：/write
+
+5. 拼接系统提示：告诉AI怎么写作
+
+6. 加载工具：write、read、search
+
+7. AI 进入循环：思考 → 调用 write → 思考 → 完成
+
+8. 返回结果：README 内容
+
+
+---
+总结（极简版）
+
+run() = AI Agent 的完整生命周期入口
+
+它负责：
+
+- 接收消息
+
+- 加载历史
+
+- 构建指令
+
+- 过滤工具
+
+- 启动AI思考循环
+
+- 实时返回事件
+
+- 最终返回答案
+
+这就是整个AI系统最核心的主方法。
+
+
+---
 
 
 
